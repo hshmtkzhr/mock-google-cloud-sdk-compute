@@ -17,6 +17,7 @@ import (
 var config *ConfigMapper
 var log *LogMapper
 var startTime time.Time
+var output = Output{}.New()
 
 func init() {
 	var err error
@@ -154,6 +155,14 @@ func performScraping(ctx context.Context, config *ConfigMapper) error {
 	if err != nil {
 		return err
 	}
+
+	// output info
+	err = output.Build(&objCompute, &objCluster)
+	if err != nil {
+		return err
+	}
+	output.PrintJSON()
+
 	// end output
 	log.WithFields(logrus.Fields{"total_elapsed_time": timeTracker(), "status": "end", "id": uuid}).Info("Scraping Complete")
 	return nil

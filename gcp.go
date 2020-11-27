@@ -1,13 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path"
 	"regexp"
+	"sync"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
+	"golang.org/x/sync/errgroup"
 
 	googlecompute "google.golang.org/api/compute/v1"
 	googlecontainer "google.golang.org/api/container/v1"
@@ -16,6 +19,7 @@ import (
 var _ = ComputeObject{} // monkey patch to put linter's "unused" alerts silence
 
 type ComputeObject struct {
+	Lock      *sync.Mutex
 	Service   *googlecompute.Service
 	Project   *googlecompute.Project
 	Region    *Region
@@ -26,6 +30,7 @@ type ComputeObject struct {
 func (obj ComputeObject) New(ctx context.Context, c *ConfigMapper) (ComputeObject, error) {
 	var err error
 	obj = ComputeObject{
+		Lock:      &sync.Mutex{},
 		Service:   &googlecompute.Service{},
 		Project:   &googlecompute.Project{},
 		Region:    &Region{},
@@ -47,7 +52,6 @@ func (obj ComputeObject) New(ctx context.Context, c *ConfigMapper) (ComputeObjec
 }
 
 func (obj *ComputeObject) SetService(ctx context.Context) error {
-	//ctx := context.Background()
 	service, err := googlecompute.NewService(ctx)
 	if err != nil {
 		return errors.Wrapf(err, "unable to create googleapi service")
@@ -106,18 +110,39 @@ type Zone struct {
 type Instances []*googlecompute.Instance
 
 func (instances *Instances) Get(obj *ComputeObject) error {
-	ctx := context.Background()
+	eg, ctx := errgroup.WithContext(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	for _, zone := range *obj.Region.ZoneList {
-		req := obj.Service.Instances.List(obj.Config.GCPConfig.ProjectID, zone.Name)
+	var getInstanceInEachZone = func(pjID, zone string) error {
+		req := obj.Service.Instances.List(pjID, zone)
 		if err := req.Pages(ctx, func(Page *googlecompute.InstanceList) error {
 			for _, instance := range Page.Items {
+				obj.Lock.Lock()
 				*instances = append(*instances, instance)
+				obj.Lock.Unlock()
 			}
 			return nil
 		}); err != nil {
 			return errors.Wrapf(err, "unable to obtain compute instances")
 		}
+		return nil
+	}
+
+	for _, zone := range *obj.Region.ZoneList {
+		zone := zone
+		eg.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return errors.New(fmt.Sprintf("canceled: get instance in the zone(%s)", zone.Name))
+			default:
+				return getInstanceInEachZone(obj.Config.GCPConfig.ProjectID, zone.Name)
+			}
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		cancel()
+		return err
 	}
 	return nil
 }
@@ -125,6 +150,7 @@ func (instances *Instances) Get(obj *ComputeObject) error {
 var _ = ClusterObject{} // monkey patch to put linter's "unused" alerts silence
 
 type ClusterObject struct {
+	Lock           *sync.Mutex
 	Service        *googlecontainer.Service
 	ClusterObj     *googlecontainer.Cluster
 	ClusterName    string
@@ -149,6 +175,7 @@ func (obj ClusterObject) New(ctx context.Context, c *ConfigMapper) (ClusterObjec
 	obj = ClusterObject{}
 	obj.Config = c
 	obj.InstanceGroups = []*ClusterInstanceGroup{}
+	obj.Lock = &sync.Mutex{}
 
 	if err = obj.SetService(ctx); err != nil {
 		return obj, err
@@ -160,7 +187,6 @@ func (obj ClusterObject) New(ctx context.Context, c *ConfigMapper) (ClusterObjec
 }
 
 func (obj *ClusterObject) SetService(ctx context.Context) error {
-	//ctx := context.Background()
 	service, err := googlecontainer.NewService(ctx)
 	if err != nil {
 		return errors.Wrapf(err, "unable to obtain google container service")
@@ -189,9 +215,9 @@ func (obj *ClusterObject) Get() error {
 }
 
 func (obj *ClusterObject) GetInstanceGroups() error {
-	var reParseIGURL = regexp.MustCompile(`^.*/projects/([^\/]+)/zones/([^\/]+)/instanceGroupManagers/([^\/]+)`)
+	var reParseIGroupURL = regexp.MustCompile(`^.*/projects/([^\/]+)/zones/([^\/]+)/instanceGroupManagers/([^\/]+)`)
 	for _, ig := range obj.ClusterObj.InstanceGroupUrls {
-		match := reParseIGURL.FindStringSubmatch(ig)
+		match := reParseIGroupURL.FindStringSubmatch(ig)
 		if len(match) != 4 {
 			return errors.New("unexpected error, url didn't match correctly")
 		}
@@ -202,22 +228,79 @@ func (obj *ClusterObject) GetInstanceGroups() error {
 }
 
 func (obj *ClusterObject) GetInstanceGroupNodes(objCompute *ComputeObject) error {
-	ctx := context.Background()
 	var err error
+	eg, ctx := errgroup.WithContext(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	req := &googlecompute.InstanceGroupsListInstancesRequest{
 		InstanceState: "ALL",
 	}
-	for _, ig := range obj.InstanceGroups {
+
+	var getInstanceFromInstanceGroup = func(ig *ClusterInstanceGroup) error {
 		reqIG := objCompute.Service.InstanceGroups.ListInstances(ig.Project, ig.Zone, ig.Name, req)
 		err = reqIG.Pages(ctx, func(page *googlecompute.InstanceGroupsListInstances) error {
 			for _, i := range page.Items {
+				obj.Lock.Lock()
 				ig.Nodes = append(ig.Nodes, &ClusterNode{Name: path.Base(i.Instance), Status: i.Status})
+				obj.Lock.Unlock()
 			}
 			return nil
 		})
 		if err != nil {
 			return errors.Wrapf(err, "InstanceGroups.ListInstances(%s) got error:", ig.Name)
 		}
+		return nil
 	}
+
+	for _, ig := range obj.InstanceGroups {
+		ig := ig
+		eg.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return errors.New(fmt.Sprintf("canceled: get instance in instace-group(%s)", ig.Name))
+			default:
+				return getInstanceFromInstanceGroup(ig)
+			}
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		cancel()
+		return err
+	}
+	return nil
+}
+
+type Output struct {
+	Code  int           `json:"code"`
+	Nodes []*OutputNode `json:"nodes"`
+	Error string        `json:"error"`
+}
+
+type OutputNode struct {
+	Name               string `json:"name"`
+	IPAddress          string `json:"ip"`
+	ClusterBelongingTo string `json:"cluster"`
+	Region             string `json:"region"`
+	Zone               string `json:"zone"`
+}
+
+func (output Output) New() Output {
+	return Output{
+		Code:  200,
+		Nodes: []*OutputNode{},
+	}
+}
+
+func (output *Output) PushNode(node *OutputNode) {
+	output.Nodes = append(output.Nodes, node)
+}
+
+func (output Output) PrintJSON() {
+	b, _ := json.Marshal(output)
+	fmt.Println(string(b))
+}
+
+func (output Output) Build(objCompute *ComputeObject, objCluster *ClusterObject) error {
 	return nil
 }
